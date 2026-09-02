@@ -222,6 +222,25 @@ nginx.ingress.kubernetes.io/proxy-body-size: "32m"
 Without `proxy-buffering: off` the client sees nothing until the response
 completes — indistinguishable from a hung request.
 
+### Exposing the dashboard separately
+
+The overlay ships **one** Ingress, which puts the dashboard on the same host and
+behind the same authentication as `/v1`. On a private cluster that is fine. On a
+reachable one it means the dashboard is only as protected as `INITIAL_PASSWORD`
+— and the published image defaults that to `CHANGEME`.
+
+Two audiences that differ this much do not fit in one Ingress resource, because
+they need different authentication. `deploy/kubernetes/overlays/k8s/ingress-split-example.yaml`
+shows the split: `/v1` and `/api/v1` on an API host protected by
+`REQUIRE_API_KEY=true`, and the dashboard on its own host behind an external
+identity provider (oauth2-proxy in the example). Swap it in for `ingress.yaml`
+in the overlay's `resources:` and set both hosts.
+
+The body-size annotation matters on the API Ingress specifically: it must not
+sit below `OMNIROUTE_CHAT_HARD_MAX_BODY_BYTES` (50 MB default), or nginx returns
+413 for requests the application would have accepted — and the app's own 413
+response, which tells the client to compact and retry, never runs.
+
 ### k3s: Traefik timeouts
 
 Traefik streams without buffering, so SSE works out of the box. What it gets
@@ -324,6 +343,14 @@ you care about.
 
 Never put `DATA_DIR` on NFS or CIFS. SQLite WAL journaling corrupts there.
 
+**Size the volume for telemetry growth, not just for configuration.** The control
+plane is small — provider connections, keys, combos are hundreds of rows — but
+`conversation_turn_nodes` and `agentic_conversations` currently have no retention
+path and grow with traffic (a reported ~190 MB/day under agentic load). Until
+[#12453](https://github.com/diegosouzapw/OmniRoute/issues/12453) lands, treat the
+PVC as sized by your retention window, and watch actual growth before trusting
+the 10Gi/20Gi defaults here.
+
 OmniRoute writes its database to `$DATA_DIR/storage.sqlite` and takes its own
 consistent snapshots into `$DATA_DIR/db_backups/` (`src/lib/db/backup.ts`, on by
 default — `DISABLE_SQLITE_AUTO_BACKUP=false`). Copy those out rather than the
@@ -365,9 +392,23 @@ cgroup, the kernel OOM-kills the pod instead of Node raising a recoverable heap
 error — you lose the process and every in-flight stream with no useful log.
 
 Heavyweight chat admission (`src/shared/middleware/chatBodyAdmission.ts`) derives
-its budget from the process's real memory ceiling via the
-`OMNIROUTE_CHAT_ADMISSION_*` knobs. Leave them alone unless you have measured a
-reason: raising them on an already-sized process reintroduces the heap abort.
+its budget from the process's real memory ceiling. Two knobs are worth knowing
+before you tune anything, because their interaction is not obvious:
+
+- **`OMNIROUTE_CHAT_MAX_HEAVY_IN_FLIGHT` is a legacy count cap that only binds
+  when you set it.** Left unset it resolves to effectively unlimited, and the
+  auto-derived ingest byte budget is what actually gates. Setting it — to `4`,
+  say — _enables_ the count cap rather than relaxing anything. If parallel agent
+  sessions are hitting `chat_admission_busy`, the byte budget is the constraint,
+  and more memory is the lever; adding this variable makes it stricter.
+- **`OMNIROUTE_CHAT_ADMISSION_QUEUE_MS`** bounds how long a heavy request waits
+  for capacity before a retryable 503. Agent loops fan out sub-requests that land
+  on the gate together, so a short wait serializes the burst instead of burning
+  the client's retry budget.
+
+Leave the rest of the `OMNIROUTE_CHAT_ADMISSION_*` family alone unless you have
+measured a reason: raising them on an already-sized process reintroduces the
+heap abort.
 
 ### Scale-out
 
