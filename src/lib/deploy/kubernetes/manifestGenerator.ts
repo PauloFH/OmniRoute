@@ -107,6 +107,60 @@ function buildLivenessProbe(spec: DeploySpec): ManifestObject {
   };
 }
 
+/**
+ * The container spec. Extracted so buildDeployment stays readable — the pod
+ * template is mostly this one object.
+ */
+function buildContainer(spec: DeploySpec): ManifestObject {
+  return {
+    name: "omniroute",
+    image: `${spec.image.repository}:${spec.image.tag}`,
+    imagePullPolicy: spec.image.pullPolicy,
+    ports: [
+      { name: "http", containerPort: DEFAULT_HTTP_PORT, protocol: "TCP" },
+      { name: "live-ws", containerPort: DEFAULT_LIVE_WS_PORT, protocol: "TCP" },
+    ],
+    envFrom: [
+      { configMapRef: { name: `${spec.releaseName}-config` } },
+      { secretRef: { name: spec.secretName } },
+    ],
+    volumeMounts: [{ name: "data", mountPath: "/app/data" }],
+    lifecycle: {
+      preStop: {
+        // Let the Service drop this endpoint before SIGTERM arrives.
+        exec: { command: ["/bin/sh", "-c", `sleep ${spec.preStopSleepSeconds}`] },
+      },
+    },
+    startupProbe: {
+      httpGet: { path: "/healthz", port: "http" },
+      periodSeconds: 5,
+      failureThreshold: 30,
+    },
+    readinessProbe: {
+      httpGet: { path: "/healthz", port: "http" },
+      periodSeconds: 5,
+      timeoutSeconds: 2,
+      failureThreshold: 6,
+    },
+    livenessProbe: buildLivenessProbe(spec),
+    resources: {
+      requests: {
+        cpu: spec.resources.requestsCpu,
+        memory: spec.resources.requestsMemory,
+      },
+      limits: {
+        cpu: spec.resources.limitsCpu,
+        memory: spec.resources.limitsMemory,
+      },
+    },
+    securityContext: {
+      allowPrivilegeEscalation: false,
+      readOnlyRootFilesystem: false,
+      capabilities: { drop: ["ALL"] },
+    },
+  };
+}
+
 export function buildDeployment(spec: DeploySpec): ManifestObject {
   return {
     apiVersion: "apps/v1",
@@ -131,55 +185,7 @@ export function buildDeployment(spec: DeploySpec): ManifestObject {
             fsGroup: 1000,
             seccompProfile: { type: "RuntimeDefault" },
           },
-          containers: [
-            {
-              name: "omniroute",
-              image: `${spec.image.repository}:${spec.image.tag}`,
-              imagePullPolicy: spec.image.pullPolicy,
-              ports: [
-                { name: "http", containerPort: DEFAULT_HTTP_PORT, protocol: "TCP" },
-                { name: "live-ws", containerPort: DEFAULT_LIVE_WS_PORT, protocol: "TCP" },
-              ],
-              envFrom: [
-                { configMapRef: { name: `${spec.releaseName}-config` } },
-                { secretRef: { name: spec.secretName } },
-              ],
-              volumeMounts: [{ name: "data", mountPath: "/app/data" }],
-              lifecycle: {
-                preStop: {
-                  // Let the Service drop this endpoint before SIGTERM arrives.
-                  exec: { command: ["/bin/sh", "-c", `sleep ${spec.preStopSleepSeconds}`] },
-                },
-              },
-              startupProbe: {
-                httpGet: { path: "/healthz", port: "http" },
-                periodSeconds: 5,
-                failureThreshold: 30,
-              },
-              readinessProbe: {
-                httpGet: { path: "/healthz", port: "http" },
-                periodSeconds: 5,
-                timeoutSeconds: 2,
-                failureThreshold: 6,
-              },
-              livenessProbe: buildLivenessProbe(spec),
-              resources: {
-                requests: {
-                  cpu: spec.resources.requestsCpu,
-                  memory: spec.resources.requestsMemory,
-                },
-                limits: {
-                  cpu: spec.resources.limitsCpu,
-                  memory: spec.resources.limitsMemory,
-                },
-              },
-              securityContext: {
-                allowPrivilegeEscalation: false,
-                readOnlyRootFilesystem: false,
-                capabilities: { drop: ["ALL"] },
-              },
-            },
-          ],
+          containers: [buildContainer(spec)],
           volumes: [
             {
               name: "data",
