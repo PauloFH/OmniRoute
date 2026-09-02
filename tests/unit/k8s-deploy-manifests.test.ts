@@ -174,6 +174,36 @@ test("the nginx Ingress disables response buffering so SSE streams", () => {
   );
 });
 
+test("the ingress body limit is not below the application's own cap", () => {
+  // Reported from a production deployment on #12400: a smaller limit here makes
+  // nginx return 413 for bodies the app would have accepted, and the app's own
+  // 413 handling (which tells the client to compact) never gets to run. Read the
+  // real default rather than restating it, so raising one side fails this test.
+  const admission = fs.readFileSync(
+    path.join(REPO_ROOT, "src/shared/middleware/chatBodyAdmission.ts"),
+    "utf8"
+  );
+  const appCap = admission.match(
+    /CHAT_HARD_MAX_BODY_BYTES = parsePositiveInt\(\s*process\.env\.OMNIROUTE_CHAT_HARD_MAX_BODY_BYTES,\s*(\d+)\s*\*\s*1024\s*\*\s*1024/
+  );
+  assert.ok(appCap, "could not read the app's hard body cap — update this test with it");
+  const appCapMb = Number(appCap[1]);
+
+  const ing = firstOfKind(
+    loadYaml<K8sDoc>("deploy/kubernetes/overlays/k8s/ingress.yaml"),
+    "Ingress"
+  );
+  const annotation = required(ing.metadata?.annotations, "ingress annotations")[
+    "nginx.ingress.kubernetes.io/proxy-body-size"
+  ];
+  const ingressMb = Number(annotation.replace(/m$/i, ""));
+
+  assert.ok(
+    ingressMb >= appCapMb,
+    `proxy-body-size (${ingressMb}m) must not be below the app cap (${appCapMb}m)`
+  );
+});
+
 test("the k3s overlay targets Traefik and k3s local-path storage", () => {
   const ing = firstOfKind(
     loadYaml<K8sDoc>("deploy/kubernetes/overlays/k3s/ingress.yaml"),

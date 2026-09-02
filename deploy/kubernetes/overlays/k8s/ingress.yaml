@@ -16,7 +16,11 @@ metadata:
     nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
     nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
-    nginx.ingress.kubernetes.io/proxy-body-size: "32m"
+    # Matches OMNIROUTE_CHAT_HARD_MAX_BODY_BYTES (50 MB, see
+    # src/shared/middleware/chatBodyAdmission.ts). A smaller value here makes
+    # nginx return 413 for bodies the application would have accepted, and the
+    # app's own 413 handling — which tells the client to compact — never runs.
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
 spec:
   ingressClassName: nginx
   rules:
