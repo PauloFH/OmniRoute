@@ -1,0 +1,248 @@
+/**
+ * Guards for the Kubernetes deployment manifests (deploy/kubernetes, deploy/helm).
+ *
+ * The invariants here are the ones that corrupt data or break streaming when
+ * they regress, not stylistic preferences:
+ *
+ *   - replicas stay 1 and the strategy stays Recreate. OmniRoute is one Node
+ *     process writing one SQLite file; two pods on one volume corrupt it.
+ *   - the PVC stays ReadWriteOnce, for the same reason.
+ *   - liveness never points at /api/monitoring/health, which does real DB work
+ *     and false-positives under load (docs/ops/MONITORING_GUIDE.md).
+ *   - the nginx Ingress keeps response buffering off, or SSE is withheld until
+ *     the provider turn ends and streaming silently stops working.
+ *   - no real secret value is ever committed.
+ */
+
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { parseAllDocuments } from "yaml";
+
+const REPO_ROOT = path.resolve(import.meta.dirname, "../..");
+const K8S_DIR = path.join(REPO_ROOT, "deploy/kubernetes");
+const HELM_DIR = path.join(REPO_ROOT, "deploy/helm/omniroute");
+
+/** Minimal shapes for the fields these tests actually assert on. */
+interface Probe {
+  httpGet?: { path?: string; port?: string };
+  tcpSocket?: { port?: string };
+}
+
+interface Container {
+  ports?: { containerPort?: number; name?: string }[];
+  lifecycle?: { preStop?: { exec?: { command?: string[] } } };
+  livenessProbe?: Probe;
+  readinessProbe?: Probe;
+  startupProbe?: Probe;
+}
+
+interface K8sDoc {
+  kind?: string;
+  metadata?: { name?: string; annotations?: Record<string, string> };
+  spec?: {
+    replicas?: number;
+    strategy?: { type?: string };
+    accessModes?: string[];
+    storageClassName?: string;
+    ingressClassName?: string;
+    template?: {
+      spec?: { containers?: Container[]; terminationGracePeriodSeconds?: number };
+    };
+  };
+  data?: Record<string, string>;
+  stringData?: Record<string, string>;
+}
+
+interface ChartValues {
+  replicaCount?: number;
+  terminationGracePeriodSeconds?: number;
+  service?: { port?: number };
+  persistence?: { accessMode?: string };
+  secrets?: Record<string, string | boolean>;
+}
+
+function loadYaml<T>(relPath: string): T[] {
+  const raw = fs.readFileSync(path.join(REPO_ROOT, relPath), "utf8");
+  return parseAllDocuments(raw)
+    .map((d) => d.toJS() as T)
+    .filter((d): d is T => d !== null && d !== undefined);
+}
+
+function firstOfKind(docs: K8sDoc[], kind: string): K8sDoc {
+  const found = docs.find((d) => d?.kind === kind);
+  assert.ok(found, `expected a ${kind} document`);
+  return found;
+}
+
+/** Narrows an optional field, failing the test instead of throwing on undefined. */
+function required<T>(value: T | undefined, what: string): T {
+  assert.ok(value !== undefined && value !== null, `missing ${what}`);
+  return value;
+}
+
+function containerOf(deploy: K8sDoc): Container {
+  return required(deploy.spec?.template?.spec?.containers?.[0], "container");
+}
+
+// ── Single-writer invariants (base manifests) ─────────────────────────────────
+
+test("base Deployment pins a single replica with the Recreate strategy", () => {
+  const deploy = firstOfKind(
+    loadYaml<K8sDoc>("deploy/kubernetes/base/deployment.yaml"),
+    "Deployment"
+  );
+  assert.equal(deploy.spec?.replicas, 1, "replicas > 1 puts two writers on one SQLite file");
+  assert.equal(
+    deploy.spec?.strategy?.type,
+    "Recreate",
+    "RollingUpdate briefly runs two pods against the same volume"
+  );
+});
+
+test("base PVC is ReadWriteOnce", () => {
+  const pvc = firstOfKind(
+    loadYaml<K8sDoc>("deploy/kubernetes/base/pvc.yaml"),
+    "PersistentVolumeClaim"
+  );
+  assert.deepEqual(pvc.spec?.accessModes, ["ReadWriteOnce"]);
+});
+
+// ── Probe invariants ──────────────────────────────────────────────────────────
+
+test("no probe targets /api/monitoring/health", () => {
+  const deploy = firstOfKind(
+    loadYaml<K8sDoc>("deploy/kubernetes/base/deployment.yaml"),
+    "Deployment"
+  );
+  const container = containerOf(deploy);
+  for (const probe of ["livenessProbe", "readinessProbe", "startupProbe"]) {
+    const target = container[probe]?.httpGet?.path;
+    assert.notEqual(
+      target,
+      "/api/monitoring/health",
+      `${probe} must not use the deep health endpoint — it does real DB work`
+    );
+  }
+  assert.equal(container.livenessProbe.httpGet.path, "/livez");
+  assert.equal(container.readinessProbe.httpGet.path, "/healthz");
+  assert.equal(container.startupProbe.httpGet.path, "/healthz");
+});
+
+test("the drain budget fits inside the termination grace period", () => {
+  const deploy = firstOfKind(
+    loadYaml<K8sDoc>("deploy/kubernetes/base/deployment.yaml"),
+    "Deployment"
+  );
+  const podSpec = required(deploy.spec?.template?.spec, "pod spec");
+  const preStop = required(
+    containerOf(deploy).lifecycle?.preStop?.exec?.command,
+    "preStop command"
+  );
+  const sleepSeconds = Number(preStop.join(" ").match(/sleep (\d+)/)?.[1]);
+  assert.ok(Number.isFinite(sleepSeconds), "preStop must sleep so endpoints drain first");
+
+  const config = firstOfKind(
+    loadYaml<K8sDoc>("deploy/kubernetes/base/configmap.yaml"),
+    "ConfigMap"
+  );
+  const shutdownSeconds =
+    Number(required(config.data, "configmap data").SHUTDOWN_TIMEOUT_MS) / 1000;
+
+  assert.ok(
+    sleepSeconds + shutdownSeconds < podSpec.terminationGracePeriodSeconds,
+    `preStop (${sleepSeconds}s) + shutdown (${shutdownSeconds}s) must fit inside ` +
+      `terminationGracePeriodSeconds (${podSpec.terminationGracePeriodSeconds}s), ` +
+      "or the kubelet SIGKILLs the pod mid-drain"
+  );
+});
+
+// ── Ingress / SSE invariants ──────────────────────────────────────────────────
+
+test("the nginx Ingress disables response buffering so SSE streams", () => {
+  const ing = firstOfKind(
+    loadYaml<K8sDoc>("deploy/kubernetes/overlays/k8s/ingress.yaml"),
+    "Ingress"
+  );
+  const ann = required(ing.metadata?.annotations, "ingress annotations");
+  assert.equal(ann["nginx.ingress.kubernetes.io/proxy-buffering"], "off");
+  assert.equal(ann["nginx.ingress.kubernetes.io/proxy-request-buffering"], "off");
+  assert.ok(
+    Number(ann["nginx.ingress.kubernetes.io/proxy-read-timeout"]) >= 600,
+    "a short read timeout cuts long provider turns mid-stream"
+  );
+});
+
+test("the k3s overlay targets Traefik and k3s local-path storage", () => {
+  const ing = firstOfKind(
+    loadYaml<K8sDoc>("deploy/kubernetes/overlays/k3s/ingress.yaml"),
+    "Ingress"
+  );
+  assert.equal(ing.spec?.ingressClassName, "traefik");
+  const pvc = firstOfKind(
+    loadYaml<K8sDoc>("deploy/kubernetes/overlays/k3s/pvc-storageclass.yaml"),
+    "PersistentVolumeClaim"
+  );
+  assert.equal(pvc.spec?.storageClassName, "local-path");
+});
+
+// ── Secret hygiene ────────────────────────────────────────────────────────────
+
+test("the committed Secret template carries only placeholders", () => {
+  const secret = firstOfKind(
+    loadYaml<K8sDoc>("deploy/kubernetes/base/secret.example.yaml"),
+    "Secret"
+  );
+  for (const [key, value] of Object.entries(required(secret.stringData, "secret stringData"))) {
+    assert.equal(value, "REPLACE_ME", `${key} must stay a placeholder in git`);
+  }
+});
+
+test("the Secret template is excluded from the base kustomization", () => {
+  const kustomization = fs.readFileSync(path.join(K8S_DIR, "base/kustomization.yaml"), "utf8");
+  assert.ok(
+    !/^\s*-\s*secret\.example\.yaml\s*$/m.test(kustomization),
+    "applying the placeholder Secret would start OmniRoute with fake auth secrets"
+  );
+});
+
+test("chart values ship no baked-in secret material", () => {
+  const values = loadYaml<ChartValues>("deploy/helm/omniroute/values.yaml")[0];
+  assert.equal(values.secrets?.create, false, "default must not create a Secret from values");
+  for (const key of ["jwtSecret", "apiKeySecret", "storageEncryptionKey", "initialPassword"]) {
+    assert.equal(values.secrets?.[key], "", `secrets.${key} must ship empty`);
+  }
+});
+
+// ── Chart consistency ─────────────────────────────────────────────────────────
+
+test("chart defaults mirror the base manifests", () => {
+  const values = loadYaml<ChartValues>("deploy/helm/omniroute/values.yaml")[0];
+  assert.equal(values.replicaCount, 1);
+  assert.equal(values.persistence?.accessMode, "ReadWriteOnce");
+
+  const deploy = firstOfKind(
+    loadYaml<K8sDoc>("deploy/kubernetes/base/deployment.yaml"),
+    "Deployment"
+  );
+  const podSpec = required(deploy.spec?.template?.spec, "pod spec");
+  assert.equal(values.terminationGracePeriodSeconds, podSpec.terminationGracePeriodSeconds);
+  assert.equal(values.service?.port, containerOf(deploy).ports?.[0]?.containerPort);
+});
+
+test("the chart refuses to render more than one replica", () => {
+  const helpers = fs.readFileSync(path.join(HELM_DIR, "templates/_helpers.tpl"), "utf8");
+  assert.match(helpers, /define "omniroute\.validate"/);
+  assert.match(helpers, /replicaCount must be 1/);
+
+  // Helm discards top-level code in a _*.tpl file, so the guard only runs if a
+  // rendered template includes it. Without this the guard is a silent no-op.
+  const deployTpl = fs.readFileSync(path.join(HELM_DIR, "templates/deployment.yaml"), "utf8");
+  assert.match(deployTpl, /include "omniroute\.validate"/);
+});
+
+test("the chart keeps the SQLite volume on uninstall", () => {
+  const pvcTpl = fs.readFileSync(path.join(HELM_DIR, "templates/pvc.yaml"), "utf8");
+  assert.match(pvcTpl, /helm\.sh\/resource-policy: keep/);
+});
