@@ -16,9 +16,9 @@ import {
   isSafeVersion,
   isSafeContextName,
   isSafeSshUser,
-} from "../../../src/lib/deploy/kubernetes/provisionPlan.ts";
-import { deploySpecSchema } from "../../../src/lib/deploy/kubernetes/types.ts";
-import { defaultSpec } from "../../../src/lib/deploy/kubernetes/manifestGenerator.ts";
+} from "../../src/lib/deploy/kubernetes/provisionPlan.ts";
+import { deploySpecSchema } from "../../src/lib/deploy/kubernetes/types.ts";
+import { defaultSpec } from "../../src/lib/deploy/kubernetes/manifestGenerator.ts";
 
 // ── The plan is advisory, never executed ─────────────────────────────────────
 

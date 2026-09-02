@@ -21,10 +21,10 @@ import {
   renderManifests,
   defaultSpec,
   ingressAnnotationsFor,
-} from "../../../src/lib/deploy/kubernetes/manifestGenerator.ts";
-import { deploySpecSchema, type DeploySpec } from "../../../src/lib/deploy/kubernetes/types.ts";
+} from "../../src/lib/deploy/kubernetes/manifestGenerator.ts";
+import { deploySpecSchema, type DeploySpec } from "../../src/lib/deploy/kubernetes/types.ts";
 
-const REPO_ROOT = path.resolve(import.meta.dirname, "../../..");
+const REPO_ROOT = path.resolve(import.meta.dirname, "../..");
 
 interface Doc {
   kind?: string;

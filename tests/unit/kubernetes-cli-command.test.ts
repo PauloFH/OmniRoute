@@ -15,7 +15,7 @@ import { promisify } from "node:util";
 import { loadAll as yamlLoadAll } from "js-yaml";
 
 const execFileAsync = promisify(execFile);
-const REPO_ROOT = path.resolve(import.meta.dirname, "../../..");
+const REPO_ROOT = path.resolve(import.meta.dirname, "../..");
 const CLI = path.join(REPO_ROOT, "bin/omniroute.mjs");
 
 /** ESC — startup notices are colorized, so any escape on stdout is a leak. */
