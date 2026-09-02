@@ -160,3 +160,69 @@ test("an image tag carrying a shell metacharacter is rejected", () => {
   const bad = { ...base, image: { ...base.image, tag: "latest; rm -rf /" } };
   assert.equal(deploySpecSchema.safeParse(bad).success, false);
 });
+
+// ── Review findings (PR #12400) ───────────────────────────────────────────────
+
+test("an address carrying a port or an IPv6 literal is rejected", () => {
+  // The plan renders `https://<address>:6443`. An address that already carries a
+  // port yields `host:123:6443`, and a bare IPv6 literal needs brackets the
+  // rendering does not add — both produce a command that looks right and is not.
+  for (const bad of ["example.com:123", "203.0.113.10:6443", "2001:db8::1", "::1", "host]"]) {
+    assert.equal(isSafeServerAddress(bad), false, `must reject: ${bad}`);
+  }
+});
+
+test("a malformed IPv4 literal is rejected", () => {
+  for (const bad of ["1.2.3.999", "300.1.1.1", "1.2.3.4.5"]) {
+    assert.equal(isSafeServerAddress(bad), false, `must reject: ${bad}`);
+  }
+  assert.equal(isSafeServerAddress("192.168.0.15"), true);
+  assert.equal(isSafeServerAddress("255.255.255.255"), true);
+});
+
+test("kubeconfig contexts from managed clusters are accepted", () => {
+  // EKS contexts are ARNs: colons and a slash are normal, not hostile.
+  assert.equal(isSafeContextName("arn:aws:eks:us-east-1:123456789:cluster/prod"), true);
+  assert.equal(isSafeContextName("gke_project_us-central1_cluster"), true);
+  for (const bad of ["ctx; id", "-flag", "ctx with space", "$(id)"]) {
+    assert.equal(isSafeContextName(bad), false, `must reject: ${bad}`);
+  }
+});
+
+test("the context name never becomes part of a filesystem path", () => {
+  // A context containing "/" would otherwise turn the temp file into a path and
+  // write outside the intended location.
+  const plan = buildProvisionPlan({
+    target: "vps",
+    serverAddress: "203.0.113.10",
+    contextName: "arn:aws:eks:us-east-1:123456789:cluster/prod",
+  });
+  const fetch = plan.steps.find((s) => s.id === "fetch-kubeconfig");
+  assert.ok(fetch);
+  assert.ok(
+    !/\/tmp\/[^\s"']*cluster\/prod/.test(fetch.command),
+    "the temp path must not be derived from the context name"
+  );
+  assert.match(fetch.command, /\/tmp\/omniroute-k3s-kubeconfig\.yaml/);
+  // The context is still used — for the rename and the verify step.
+  assert.match(fetch.command, /cluster\/prod/);
+});
+
+test("the Kubernetes decimal thousand suffix is accepted", () => {
+  // Kubernetes spells it lowercase `k`; the first pattern accepted only `K`.
+  const base = defaultSpec("local");
+  for (const size of ["512k", "512K", "2Gi", "500m", "10G", "1Pi", "1Ei"]) {
+    assert.equal(
+      deploySpecSchema.safeParse({ ...base, storage: { ...base.storage, size } }).success,
+      true,
+      `must accept the quantity ${size}`
+    );
+  }
+  for (const bad of ["2GB", "2 Gi", "abc", "2Gi; id"]) {
+    assert.equal(
+      deploySpecSchema.safeParse({ ...base, storage: { ...base.storage, size: bad } }).success,
+      false,
+      `must reject: ${bad}`
+    );
+  }
+});

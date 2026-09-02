@@ -54,22 +54,46 @@ export interface ProvisionPlanInput {
 
 /**
  * Address values are interpolated into commands the operator reads before
- * running, but a shell metacharacter would still make the rendered command mean
- * something other than it looks like. Keep them to hostname/IP shapes.
+ * running, so a shell metacharacter would make the rendered command mean
+ * something other than it looks like.
+ *
+ * Restricted to a hostname or an IPv4 literal — deliberately no port and no
+ * IPv6. The plan renders `https://<address>:6443`, so an address that already
+ * carried a port would produce `host:123:6443`, and a bare IPv6 literal would
+ * need brackets the rendering does not add. Rejecting them beats emitting a
+ * command that looks correct and is not.
  */
 export function isSafeServerAddress(value: string): boolean {
-  return (
-    /^[A-Za-z0-9][A-Za-z0-9.\-:]{0,252}[A-Za-z0-9\]]$/.test(value) &&
-    !/[;&|`$(){}<>\s'"\\]/.test(value)
-  );
+  if (value.length > 253) return false;
+  if (/^(\d{1,3}\.){3}\d{1,3}$/.test(value)) {
+    return value.split(".").every((octet) => Number(octet) <= 255);
+  }
+  if (
+    !/^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$/.test(
+      value
+    )
+  ) {
+    return false;
+  }
+  // An all-numeric final label means this was meant to be an IP address and is
+  // malformed (1.2.3.4.5), not a hostname — a real TLD is never all digits.
+  const lastLabel = value.split(".").pop() ?? "";
+  return !/^\d+$/.test(lastLabel);
 }
 
 export function isSafeVersion(value: string): boolean {
   return /^v?\d+\.\d+\.\d+(\+k3s\d+)?$/.test(value);
 }
 
+/**
+ * kubeconfig context names. Managed clusters produce colons and slashes — an
+ * EKS context is `arn:aws:eks:<region>:<account>:cluster/<name>` — so both are
+ * allowed. Safe because the value is never used as a path component (the
+ * fetch-kubeconfig step uses a fixed temp filename) and cannot start with `-`,
+ * which is what would let it be read as an option.
+ */
 export function isSafeContextName(value: string): boolean {
-  return /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/.test(value);
+  return /^[A-Za-z0-9][A-Za-z0-9._@:/-]{0,127}$/.test(value);
 }
 
 export function isSafeSshUser(value: string): boolean {
@@ -186,12 +210,15 @@ function vpsSteps(input: ProvisionPlanInput): ProvisionStep[] {
         "sed rewrites the server address so your workstation reaches the real host, " +
         "and the context is renamed so it does not collide with an existing 'default'.",
       command: [
-        `ssh ${user}@${address} "sudo cat /etc/rancher/k3s/k3s.yaml" > /tmp/k3s-${context}.yaml`,
-        `sed -i "s#https://127.0.0.1:6443#https://${address}:6443#" /tmp/k3s-${context}.yaml`,
-        `sed -i "s#: default#: ${context}#" /tmp/k3s-${context}.yaml`,
-        `KUBECONFIG=~/.kube/config:/tmp/k3s-${context}.yaml kubectl config view --flatten > /tmp/merged-config`,
-        `mkdir -p ~/.kube && mv /tmp/merged-config ~/.kube/config && chmod 600 ~/.kube/config`,
-        `rm -f /tmp/k3s-${context}.yaml`,
+        // The temp filename is fixed, never derived from the context: a context
+        // name may legitimately contain "/" (EKS), which would otherwise turn
+        // this into a path and write somewhere unintended.
+        `ssh ${user}@${address} "sudo cat /etc/rancher/k3s/k3s.yaml" > /tmp/omniroute-k3s-kubeconfig.yaml`,
+        `sed -i "s#https://127.0.0.1:6443#https://${address}:6443#" /tmp/omniroute-k3s-kubeconfig.yaml`,
+        `sed -i "s#: default#: ${context}#" /tmp/omniroute-k3s-kubeconfig.yaml`,
+        `KUBECONFIG=~/.kube/config:/tmp/omniroute-k3s-kubeconfig.yaml kubectl config view --flatten > /tmp/omniroute-merged-kubeconfig`,
+        `mkdir -p ~/.kube && mv /tmp/omniroute-merged-kubeconfig ~/.kube/config && chmod 600 ~/.kube/config`,
+        `rm -f /tmp/omniroute-k3s-kubeconfig.yaml`,
       ].join(" && "),
       location: "workstation",
       privileged: false,

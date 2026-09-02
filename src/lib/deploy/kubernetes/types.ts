@@ -36,11 +36,14 @@ const hostname = z
   .max(253)
   .regex(/^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$/, "must be a lowercase DNS hostname");
 
+// Kubernetes quantity suffixes: decimal (m, k, M, G, T, P, E) and binary
+// (Ki, Mi, Gi, Ti, Pi, Ei). The decimal thousand is a lowercase `k` — the
+// previous pattern rejected it while accepting only `K`.
 const quantity = z
   .string()
   .regex(
-    /^\d+(\.\d+)?(m|Mi|Gi|Ki|Ti|M|G|K|T)?$/,
-    "must be a Kubernetes quantity, e.g. 500m or 2Gi"
+    /^\d+(\.\d+)?(m|Ki|Mi|Gi|Ti|Pi|Ei|k|K|M|G|T|P|E)?$/,
+    "must be a Kubernetes quantity, e.g. 500m, 512k or 2Gi"
   );
 
 export const deploySpecSchema = z
@@ -140,7 +143,7 @@ export type DeploySpec = z.infer<typeof deploySpecSchema>;
  * helper does not model, so callers can skip the check rather than guess.
  */
 export function parseMemoryToMib(value: string): number | null {
-  const match = value.match(/^(\d+(?:\.\d+)?)(Ki|Mi|Gi|Ti|K|M|G|T)?$/);
+  const match = value.match(/^(\d+(?:\.\d+)?)(Ki|Mi|Gi|Ti|Pi|Ei|k|K|M|G|T|P|E)?$/);
   if (!match) return null;
   const amount = Number(match[1]);
   const factors: Record<string, number> = {
@@ -148,10 +151,15 @@ export function parseMemoryToMib(value: string): number | null {
     Mi: 1,
     Gi: 1024,
     Ti: 1024 * 1024,
+    Pi: 1024 * 1024 * 1024,
+    Ei: 1024 * 1024 * 1024 * 1024,
+    k: 1000 / (1024 * 1024),
     K: 1000 / (1024 * 1024),
     M: 1_000_000 / (1024 * 1024),
     G: 1_000_000_000 / (1024 * 1024),
     T: 1_000_000_000_000 / (1024 * 1024),
+    P: 1_000_000_000_000_000 / (1024 * 1024),
+    E: 1_000_000_000_000_000_000 / (1024 * 1024),
   };
   const unit = match[2];
   if (!unit) return amount / (1024 * 1024); // bare bytes
