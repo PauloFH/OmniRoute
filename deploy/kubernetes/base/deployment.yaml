@@ -1,0 +1,107 @@
+# Single-replica by design.
+#
+# Stock OmniRoute is one Node process writing one SQLite file. Two pods bound to
+# the same volume corrupt the database, so `replicas` MUST stay 1 and the
+# strategy MUST be Recreate — RollingUpdate would briefly run two writers.
+# To add capacity, run N independent releases each with its own PVC (see
+# docs/ops/KUBERNETES_DEPLOYMENT_GUIDE.md → "Scale-out"), never replicas > 1.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: omniroute
+  labels:
+    app.kubernetes.io/name: omniroute
+    app.kubernetes.io/component: server
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: omniroute
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: omniroute
+        app.kubernetes.io/component: server
+    spec:
+      # 15s preStop + 30s SHUTDOWN_TIMEOUT_MS for in-flight SSE, with headroom.
+      terminationGracePeriodSeconds: 90
+      securityContext:
+        runAsNonRoot: true
+        # 1000 = the `node` user in the published image.
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: omniroute
+          image: diegosouzapw/omniroute:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 20128
+              protocol: TCP
+            - name: live-ws
+              containerPort: 20132
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: omniroute-config
+            - secretRef:
+                name: omniroute-secrets
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+          lifecycle:
+            preStop:
+              exec:
+                # Let kube-proxy drop this pod from Service endpoints before
+                # SIGTERM, so new traffic stops arriving at a dying process.
+                command: ["/bin/sh", "-c", "sleep 15"]
+          # Cold start runs SQLite migrations; give it up to 150s before the
+          # kubelet starts counting liveness failures.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 6
+          # /livez is process-alive only. Never point liveness at
+          # /api/monitoring/health — it does real DB work and false-positives
+          # under load. Under event-loop stalls, switch to tcpSocket (see the
+          # k8s overlay patch).
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              # Raise together with NODE_OPTIONS --max-old-space-size in the
+              # ConfigMap. Large /v1/responses payloads need far more; see the
+              # sizing table in the deployment guide.
+              cpu: "2"
+              memory: 4Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: omniroute-data
