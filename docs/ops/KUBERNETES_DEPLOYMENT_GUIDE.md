@@ -98,8 +98,10 @@ Preview without applying — worth doing before every change:
 kubectl kustomize deploy/kubernetes/overlays/k3s
 ```
 
-Watch it come up. Cold start runs SQLite migrations and can take a minute; the
-startup probe allows 150s before liveness begins counting:
+Watch it come up. Cold start runs SQLite migrations, replays the WAL and runs
+the startup cleanup VACUUM — minutes on a large database. The startup probe
+allows 10 minutes before liveness begins counting, and readiness keeps traffic
+away for exactly as long as it takes:
 
 ```bash
 kubectl -n omniroute rollout status deploy/omniroute
@@ -283,26 +285,59 @@ polling:
 The manifests follow
 [MONITORING_GUIDE.md](MONITORING_GUIDE.md#kubernetes-probe-recommendations):
 
-| Probe     | Target                  | Why                                                 |
-| --------- | ----------------------- | --------------------------------------------------- |
-| Startup   | `GET /healthz`, 30 × 5s | Cold start + SQLite migrations exceed a few seconds |
-| Readiness | `GET /healthz`          | Lifecycle state; 200 vs 503                         |
-| Liveness  | `GET /livez` (or TCP)   | Process-alive only                                  |
+| Probe     | Target                   | Why                                                   |
+| --------- | ------------------------ | ----------------------------------------------------- |
+| Startup   | `GET /healthz`, 120 × 5s | Cold start = migrations + WAL replay + cleanup VACUUM |
+| Readiness | `GET /healthz`           | Lifecycle state; 200 vs 503                           |
+| Liveness  | **tcpSocket** on `http`  | Process-alive only, and cannot be starved by the loop |
 
 **Never point liveness at `/api/monitoring/health`.** It does real DB and
 monitoring work and will false-positive under load, restarting your only pod.
 
-If HTTP liveness times out under catalog or compression load, switch to TCP —
-a busy event loop is not a dead process. Kustomize:
+### Why liveness is TCP by default
+
+`better-sqlite3` is synchronous. A large checkpoint or a `VACUUM` blocks the
+event loop for as long as it runs — minutes on a multi-hundred-MB database on
+network storage — and every HTTP handler stops answering while the process is
+perfectly healthy. `/livez` is no exception: it shares the loop.
+
+The failure that follows is self-amplifying, and has been observed in
+production on this topology: HTTP liveness times out mid-VACUUM → the kubelet
+kills the pod → the interrupted write leaves a larger WAL → the next cold start
+is slower → it gets killed again.
+
+The asymmetry decides the default. A wrong HTTP liveness restarts a pod
+mid-write and grows the data file; a wrong TCP liveness merely lets a
+hung-but-listening process survive until someone looks. **Readiness stays on
+HTTP** and is what pulls a stalled pod out of the Service — liveness only
+exists to restart a process that cannot recover.
+
+Both budgets follow from the same fact:
+
+| Setting                         | Value | Because                                                                   |
+| ------------------------------- | ----- | ------------------------------------------------------------------------- |
+| `startupProbe.failureThreshold` | `120` | 10 min for WAL replay + cleanup VACUUM; readiness holds traffic meanwhile |
+| `terminationGracePeriodSeconds` | `300` | The post-drain WAL checkpoint has no timeout; a healthy pod exits in ~45s |
+
+`terminationGracePeriodSeconds` is a **ceiling, not a delay**. `SHUTDOWN_TIMEOUT_MS`
+(30s) bounds only the request drain; `closeDbInstance()` then checkpoints the
+WAL with no timeout of its own, and a `SIGKILL` mid-checkpoint carries the fat
+WAL into the next boot. Note the interaction with `Recreate`: a pod that really
+does hang delays the replacement by up to 5 minutes.
+
+To go back to HTTP liveness — defensible on a small database on fast local
+storage, where no single SQLite operation can outlast the failure threshold, and
+where HTTP catches a wedged server that TCP cannot. Verify with
+`PRAGMA wal_checkpoint(TRUNCATE)` timings on your own volume first. Kustomize:
 
 ```bash
-# add deploy/kubernetes/overlays/k8s/liveness-tcp.yaml to the overlay's patches:
+# add deploy/kubernetes/overlays/k8s/liveness-http.yaml to the overlay's patches:
 ```
 
 Helm:
 
 ```bash
---set probes.livenessType=tcp
+--set probes.livenessType=http
 ```
 
 ---
@@ -434,7 +469,7 @@ store, not shared SQLite.
 
 | Symptom                                           | Cause                                                                                                                                                                                                               |
 | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Pod restarts under load                           | HTTP liveness timing out on a busy event loop → switch to TCP                                                                                                                                                       |
+| Pod restarts under load                           | HTTP liveness timing out on a busy event loop. The base manifests already use TCP — check you did not apply `liveness-http.yaml` or `--set probes.livenessType=http`                                                |
 | Streaming responses arrive all at once at the end | Ingress response buffering is on                                                                                                                                                                                    |
 | Long requests cut off mid-stream                  | Ingress read/idle timeout too low                                                                                                                                                                                   |
 | `502` right after an upgrade                      | Expected: the Recreate empty-endpoint window                                                                                                                                                                        |
@@ -443,6 +478,7 @@ store, not shared SQLite.
 | Dashboard live view stuck                         | `LIVE_WS_ALLOWED_ORIGINS` does not match the browser origin, or `live-ws` is not routed                                                                                                                             |
 | Ingress created but nothing routes                | The `ingressClassName` names a controller the cluster does not run. A k3s installed with `--disable=traefik` has no `traefik` class, and the API server accepts the object anyway. Check `kubectl get ingressclass` |
 | `database is locked` / corruption                 | Two writers, or the PVC is on NFS/CIFS                                                                                                                                                                              |
+| Restart loop that gets slower each time           | A probe is killing the pod mid-VACUUM/checkpoint, growing the WAL. Check the startup budget and that liveness is TCP                                                                                                |
 
 ```bash
 kubectl -n omniroute describe pod -l app.kubernetes.io/name=omniroute

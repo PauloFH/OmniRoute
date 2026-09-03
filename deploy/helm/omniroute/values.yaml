@@ -83,8 +83,9 @@ config:
   requireApiKey: false
   # Comma-separated origins allowed to open the dashboard live WebSocket.
   liveWsAllowedOrigins: "http://localhost:20128,http://127.0.0.1:20128"
-  # Graceful-shutdown budget for in-flight SSE. Keep it below
-  # terminationGracePeriodSeconds minus preStopSleepSeconds.
+  # Graceful-shutdown budget for the in-flight SSE drain only — the WAL
+  # checkpoint that follows it is unbounded. Keep it below
+  # terminationGracePeriodSeconds minus preStopSleepSeconds, with room to spare.
   shutdownTimeoutMs: 30000
   # V8 old-space ceiling in MiB. Keep it well under resources.limits.memory or
   # the pod is OOMKilled instead of raising a recoverable heap error.
@@ -110,14 +111,23 @@ resources:
 # Seconds to sleep in preStop so the Service drops this pod's endpoint before
 # SIGTERM reaches the process.
 preStopSleepSeconds: 15
-terminationGracePeriodSeconds: 90
+# A ceiling, not a delay. The request drain is bounded by shutdownTimeoutMs,
+# but the WAL checkpoint that follows it is not — on a large database on
+# network storage that runs for minutes, and a SIGKILL mid-checkpoint carries
+# the fat WAL into the next boot. A healthy pod still exits in ~45s.
+terminationGracePeriodSeconds: 300
 
 probes:
-  # "http" uses GET /livez; "tcp" probes the port. Switch to "tcp" if HTTP
-  # liveness times out under catalog/compression load — a busy event loop is
-  # not a dead process.
-  livenessType: http
-  startupFailureThreshold: 30
+  # "tcp" probes the port; "http" uses GET /livez. TCP is the default because
+  # better-sqlite3 is synchronous: a large checkpoint or VACUUM blocks the
+  # event loop for minutes, and HTTP liveness reads that as a dead process and
+  # restarts the pod mid-write — which bloats the WAL and makes the next boot
+  # slower still. Readiness stays on HTTP and is what removes a stalled pod
+  # from the Service. Set "http" only on small databases on fast local storage.
+  livenessType: tcp
+  # 120 x 5s = 10 min. Cold start replays the WAL and runs the startup cleanup
+  # VACUUM, not just migrations. Readiness holds traffic back meanwhile.
+  startupFailureThreshold: 120
   readinessFailureThreshold: 6
 
 podAnnotations: {}

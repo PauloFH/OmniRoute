@@ -8,7 +8,12 @@
  *     process writing one SQLite file; two pods on one volume corrupt it.
  *   - the PVC stays ReadWriteOnce, for the same reason.
  *   - liveness never points at /api/monitoring/health, which does real DB work
- *     and false-positives under load (docs/ops/MONITORING_GUIDE.md).
+ *     and false-positives under load (docs/ops/MONITORING_GUIDE.md), and stays
+ *     on tcpSocket: better-sqlite3 is synchronous, so a checkpoint or VACUUM
+ *     stalls every HTTP handler and an HTTP probe would restart the pod
+ *     mid-write.
+ *   - the termination grace period leaves room for the WAL checkpoint that
+ *     runs after the request drain, which has no timeout of its own.
  *   - the nginx Ingress keeps response buffering off, or SSE is withheld until
  *     the provider turn ends and streaming silently stops working.
  *   - no real secret value is ever committed.
@@ -28,6 +33,8 @@ const HELM_DIR = path.join(REPO_ROOT, "deploy/helm/omniroute");
 interface Probe {
   httpGet?: { path?: string; port?: string };
   tcpSocket?: { port?: string };
+  periodSeconds?: number;
+  failureThreshold?: number;
 }
 
 interface Container {
@@ -58,6 +65,7 @@ interface K8sDoc {
 interface ChartValues {
   replicaCount?: number;
   terminationGracePeriodSeconds?: number;
+  probes?: { livenessType?: string; startupFailureThreshold?: number };
   service?: { port?: number };
   persistence?: { accessMode?: string };
   secrets?: Record<string, string | boolean>;
@@ -125,9 +133,61 @@ test("no probe targets /api/monitoring/health", () => {
       `${probe} must not use the deep health endpoint — it does real DB work`
     );
   }
-  assert.equal(container.livenessProbe.httpGet.path, "/livez");
   assert.equal(container.readinessProbe.httpGet.path, "/healthz");
   assert.equal(container.startupProbe.httpGet.path, "/healthz");
+});
+
+test("liveness is tcpSocket, because a synchronous checkpoint stalls HTTP", () => {
+  const deploy = firstOfKind(
+    loadYaml<K8sDoc>("deploy/kubernetes/base/deployment.yaml"),
+    "Deployment"
+  );
+  const liveness = required(containerOf(deploy).livenessProbe, "liveness probe");
+
+  // better-sqlite3 blocks the event loop, so /livez stops answering during a
+  // large checkpoint or VACUUM while the process is perfectly healthy. An HTTP
+  // probe restarts the pod mid-write, which grows the WAL and makes the next
+  // boot slower still. Readiness (HTTP) is what removes a stalled pod from the
+  // Service; liveness only exists to restart an unrecoverable process.
+  assert.ok(liveness.tcpSocket, "liveness must be tcpSocket, not httpGet");
+  assert.equal(liveness.httpGet, undefined);
+
+  // The opt-in patch back to HTTP must stay available and must clear tcpSocket,
+  // or a strategic-merge patch would leave a container with two probe handlers.
+  const patch = firstOfKind(
+    loadYaml<K8sDoc>("deploy/kubernetes/overlays/k8s/liveness-http.yaml"),
+    "Deployment"
+  );
+  const patched = required(containerOf(patch).livenessProbe, "patched liveness probe");
+  assert.equal(patched.httpGet?.path, "/livez");
+  assert.equal(patched.tcpSocket, null, "the patch must null out tcpSocket");
+});
+
+test("the startup budget covers the cold-start VACUUM, not just migrations", () => {
+  const deploy = firstOfKind(
+    loadYaml<K8sDoc>("deploy/kubernetes/base/deployment.yaml"),
+    "Deployment"
+  );
+  const startup = required(containerOf(deploy).startupProbe, "startup probe");
+  const budgetSeconds = (startup.periodSeconds ?? 0) * (startup.failureThreshold ?? 0);
+
+  // Cold start replays the WAL and runs the startup cleanup VACUUM, which is
+  // minutes on a large database on network storage. Killing the pod mid-VACUUM
+  // is what creates the oversized WAL that makes the next boot slower, so a
+  // tight budget here is self-amplifying. Readiness holds traffic back for
+  // exactly as long as this takes, so the budget is free.
+  assert.ok(
+    budgetSeconds >= 600,
+    `startup budget is ${budgetSeconds}s; a cold-start VACUUM on a large ` +
+      "database takes minutes, and a kill mid-VACUUM makes the next boot slower"
+  );
+
+  const cleanup = fs.readFileSync(path.join(REPO_ROOT, "src/lib/db/cleanup.ts"), "utf8");
+  assert.match(
+    cleanup,
+    /startCleanupScheduler[\s\S]*?db\.exec\("VACUUM"\)/,
+    "startup cleanup no longer VACUUMs — re-derive the startup budget"
+  );
 });
 
 test("the drain budget fits inside the termination grace period", () => {
@@ -150,11 +210,38 @@ test("the drain budget fits inside the termination grace period", () => {
   const shutdownSeconds =
     Number(required(config.data, "configmap data").SHUTDOWN_TIMEOUT_MS) / 1000;
 
+  const graceSeconds = required(
+    podSpec.terminationGracePeriodSeconds,
+    "terminationGracePeriodSeconds"
+  );
   assert.ok(
-    sleepSeconds + shutdownSeconds < podSpec.terminationGracePeriodSeconds,
+    sleepSeconds + shutdownSeconds < graceSeconds,
     `preStop (${sleepSeconds}s) + shutdown (${shutdownSeconds}s) must fit inside ` +
-      `terminationGracePeriodSeconds (${podSpec.terminationGracePeriodSeconds}s), ` +
+      `terminationGracePeriodSeconds (${graceSeconds}s), ` +
       "or the kubelet SIGKILLs the pod mid-drain"
+  );
+
+  // The drain is only the first half of shutdown. gracefulShutdown.ts awaits
+  // waitForDrain() — the part SHUTDOWN_TIMEOUT_MS bounds — and only then runs
+  // cleanup(), whose closeDbInstance() checkpoints the WAL with no timeout of
+  // its own. On a large WAL on network storage that is minutes, and a SIGKILL
+  // mid-checkpoint carries the fat WAL into the next boot. So the grace period
+  // must leave real headroom past the drain, not just fit it.
+  const checkpointHeadroom = graceSeconds - sleepSeconds - shutdownSeconds;
+  assert.ok(
+    checkpointHeadroom >= 180,
+    `only ${checkpointHeadroom}s left after the drain for the WAL checkpoint; ` +
+      "a large checkpoint on network storage takes minutes and has no timeout"
+  );
+
+  const shutdownSrc = fs.readFileSync(path.join(REPO_ROOT, "src/lib/gracefulShutdown.ts"), "utf8");
+  const drainAt = shutdownSrc.indexOf("await waitForDrain()");
+  const cleanupAt = shutdownSrc.indexOf("await cleanup()");
+  assert.ok(drainAt >= 0 && cleanupAt > drainAt, "cleanup() must still run after the drain");
+  assert.match(
+    shutdownSrc,
+    /closeDbInstance\(\)/,
+    "shutdown no longer closes the DB — re-derive the checkpoint headroom above"
   );
 });
 
@@ -259,6 +346,14 @@ test("chart defaults mirror the base manifests", () => {
   const podSpec = required(deploy.spec?.template?.spec, "pod spec");
   assert.equal(values.terminationGracePeriodSeconds, podSpec.terminationGracePeriodSeconds);
   assert.equal(values.service?.port, containerOf(deploy).ports?.[0]?.containerPort);
+
+  // The chart must default to the same probe posture as the base manifests, or
+  // Helm users silently get the HTTP liveness the Kustomize path rejects.
+  assert.equal(values.probes?.livenessType, "tcp");
+  assert.equal(
+    values.probes?.startupFailureThreshold,
+    containerOf(deploy).startupProbe?.failureThreshold
+  );
 });
 
 test("the chart refuses to render more than one replica", () => {

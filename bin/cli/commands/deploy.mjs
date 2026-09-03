@@ -223,7 +223,7 @@ export function registerDeploy(program) {
     .option("--no-require-api-key", "do not require an API key on /v1/*")
     .option("--log-level <level>", "trace, debug, info, warn, error or fatal")
     .option("--ws-origins <origins>", "comma-separated allowed WebSocket origins")
-    .option("--liveness <kind>", "liveness probe: http or tcp")
+    .option("--liveness <kind>", "liveness probe: tcp (default) or http")
     .option("--json", "print the resolved spec as JSON instead of YAML")
     .action(async (opts) => {
       const code = await runManifestsCommand(opts);

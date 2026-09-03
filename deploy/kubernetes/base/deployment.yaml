@@ -25,8 +25,14 @@ spec:
         app.kubernetes.io/name: omniroute
         app.kubernetes.io/component: server
     spec:
-      # 15s preStop + 30s SHUTDOWN_TIMEOUT_MS for in-flight SSE, with headroom.
-      terminationGracePeriodSeconds: 90
+      # 15s preStop + 30s SHUTDOWN_TIMEOUT_MS drains in-flight SSE — but the
+      # drain is only the first half. gracefulShutdown.ts runs cleanup() after
+      # waitForDrain(), and closeDbInstance() checkpoints the WAL (TRUNCATE)
+      # with no timeout of its own. On a multi-hundred-MB WAL on network
+      # storage that is minutes, and a SIGKILL mid-checkpoint carries the fat
+      # WAL into the next boot. The budget is a ceiling, not a delay: a healthy
+      # pod still exits in ~45s.
+      terminationGracePeriodSeconds: 300
       securityContext:
         runAsNonRoot: true
         # 1000 = the `node` user in the published image.
@@ -60,14 +66,22 @@ spec:
                 # Let kube-proxy drop this pod from Service endpoints before
                 # SIGTERM, so new traffic stops arriving at a dying process.
                 command: ["/bin/sh", "-c", "sleep 15"]
-          # Cold start runs SQLite migrations; give it up to 150s before the
-          # kubelet starts counting liveness failures.
+          # Cold start is not just migrations: it also replays the WAL and runs
+          # the startup cleanup VACUUM (src/lib/db/cleanup.ts). On a ~1 GB
+          # database on network storage that is minutes. A kill mid-VACUUM is
+          # what *creates* the oversized WAL that makes the next boot slower,
+          # so a tight budget here is self-amplifying. 10 min costs nothing —
+          # readiness keeps traffic away for exactly as long as it takes.
           startupProbe:
             httpGet:
               path: /healthz
               port: http
             periodSeconds: 5
-            failureThreshold: 30
+            # The kubelet default is 1s, and /healthz shares the event loop —
+            # it exceeds 1s even on a trivial boot, and by minutes during the
+            # cold-start VACUUM.
+            timeoutSeconds: 3
+            failureThreshold: 120
           readinessProbe:
             httpGet:
               path: /healthz
@@ -75,16 +89,21 @@ spec:
             periodSeconds: 5
             timeoutSeconds: 2
             failureThreshold: 6
-          # /livez is process-alive only. Never point liveness at
-          # /api/monitoring/health — it does real DB work and false-positives
-          # under load. Under event-loop stalls, switch to tcpSocket (see the
-          # k8s overlay patch).
+          # TCP, not HTTP, and deliberately so. better-sqlite3 is synchronous:
+          # a large checkpoint or VACUUM blocks the event loop for minutes, so
+          # every HTTP handler — /livez included — stops answering while the
+          # process is perfectly healthy. The asymmetry decides it: a wrong
+          # HTTP liveness kills the pod mid-VACUUM and bloats the WAL, which
+          # makes the next boot slower still (a self-amplifying crashloop,
+          # observed in production); a wrong TCP liveness lets a hung-but-
+          # listening process survive until a human looks. Readiness stays on
+          # HTTP and is what pulls a stalled pod out of the Service.
+          # Never point liveness at /api/monitoring/health — it does real DB
+          # work. For HTTP liveness anyway, see overlays/k8s/liveness-http.yaml.
           livenessProbe:
-            httpGet:
-              path: /livez
+            tcpSocket:
               port: http
-            periodSeconds: 10
-            timeoutSeconds: 3
+            periodSeconds: 20
             failureThreshold: 6
           resources:
             requests:

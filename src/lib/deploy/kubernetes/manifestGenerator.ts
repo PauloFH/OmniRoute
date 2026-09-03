@@ -95,7 +95,9 @@ export function buildPvc(spec: DeploySpec): ManifestObject {
 
 function buildLivenessProbe(spec: DeploySpec): ManifestObject {
   // Never /api/monitoring/health: it does real DB work and false-positives
-  // under load, restarting the only replica.
+  // under load, restarting the only replica. TCP is the default (see
+  // defaultSpec) because a synchronous SQLite checkpoint or VACUUM blocks the
+  // event loop for minutes, and HTTP liveness reads that as a dead process.
   if (spec.livenessProbe === "tcp") {
     return { tcpSocket: { port: "http" }, periodSeconds: 20, failureThreshold: 6 };
   }
@@ -134,7 +136,12 @@ function buildContainer(spec: DeploySpec): ManifestObject {
     startupProbe: {
       httpGet: { path: "/healthz", port: "http" },
       periodSeconds: 5,
-      failureThreshold: 30,
+      // The kubelet default is 1s, and /healthz shares the event loop.
+      timeoutSeconds: 3,
+      // 10 min. Cold start replays the WAL and runs the startup cleanup
+      // VACUUM (src/lib/db/cleanup.ts), not just migrations; a kill mid-VACUUM
+      // grows the WAL and makes the next boot slower still.
+      failureThreshold: 120,
     },
     readinessProbe: {
       httpGet: { path: "/healthz", port: "http" },
@@ -341,8 +348,11 @@ export function defaultSpec(target: DeployTargetKind): DeploySpec {
     },
     secretName: "omniroute-secrets",
     preStopSleepSeconds: 15,
-    terminationGracePeriodSeconds: 90,
-    livenessProbe: "http" as const,
+    // A ceiling, not a delay: the post-drain WAL checkpoint in
+    // closeDbInstance() has no timeout of its own, and a SIGKILL mid-checkpoint
+    // carries the fat WAL into the next boot. A healthy pod still exits in ~45s.
+    terminationGracePeriodSeconds: 300,
+    livenessProbe: "tcp" as const,
   };
 
   if (target === "local") {

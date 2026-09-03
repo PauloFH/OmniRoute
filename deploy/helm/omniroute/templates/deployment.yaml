@@ -72,13 +72,15 @@ spec:
                 # Drop this pod from Service endpoints before SIGTERM lands, so
                 # new traffic stops arriving at a process that is shutting down.
                 command: ["/bin/sh", "-c", "sleep {{ .Values.preStopSleepSeconds }}"]
-          # Cold start runs SQLite migrations, so liveness must not start
-          # counting until the startup probe passes.
+          # Cold start runs migrations, WAL replay and the startup cleanup
+          # VACUUM, so liveness must not start counting until this passes.
           startupProbe:
             httpGet:
               path: /healthz
               port: http
             periodSeconds: 5
+            # The kubelet default is 1s, and /healthz shares the event loop.
+            timeoutSeconds: 3
             failureThreshold: {{ .Values.probes.startupFailureThreshold }}
           readinessProbe:
             httpGet:
@@ -88,7 +90,8 @@ spec:
             timeoutSeconds: 2
             failureThreshold: {{ .Values.probes.readinessFailureThreshold }}
           # Never /api/monitoring/health here — it does real DB work and
-          # false-positives under load.
+          # false-positives under load. TCP is the default (probes.livenessType)
+          # because a synchronous SQLite checkpoint stalls every HTTP handler.
           livenessProbe:
             {{- if eq .Values.probes.livenessType "tcp" }}
             tcpSocket:
