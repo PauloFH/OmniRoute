@@ -194,6 +194,11 @@ test("generated manifests agree with deploy/kubernetes/base", () => {
     "readiness probe drifted from the committed manifest"
   );
   assert.deepEqual(
+    baseContainer.livenessProbe,
+    genContainer.livenessProbe,
+    "liveness probe drifted from the committed manifest — both must default to tcpSocket"
+  );
+  assert.deepEqual(
     baseContainer.ports,
     genContainer.ports,
     "container ports drifted from the committed manifest"
