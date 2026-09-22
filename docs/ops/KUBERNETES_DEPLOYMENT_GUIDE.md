@@ -1,3 +1,9 @@
+---
+title: "Kubernetes Deployment Guide"
+version: 3.8.51
+lastUpdated: 2026-09-22
+---
+
 # Kubernetes deployment guide (k3s and k8s)
 
 Manifests and a Helm chart for running OmniRoute on Kubernetes — k3s (single node
