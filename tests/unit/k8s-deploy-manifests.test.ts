@@ -152,6 +152,20 @@ test("liveness is tcpSocket, because a synchronous checkpoint stalls HTTP", () =
   assert.ok(liveness.tcpSocket, "liveness must be tcpSocket, not httpGet");
   assert.equal(liveness.httpGet, undefined);
 
+  // The blocking full rebuild still exists on a live, healthy process: the
+  // vacuum scheduler runs it at the configured hour, and cleanup defers one to
+  // that window on an auto_vacuum=NONE database (#12821 moved it off the
+  // cleanup path; it did not remove it).
+  const vacuumScheduler = fs.readFileSync(
+    path.join(REPO_ROOT, "src/lib/db/vacuumScheduler.ts"),
+    "utf8"
+  );
+  assert.match(
+    vacuumScheduler,
+    /db\.exec\("VACUUM"\)/,
+    "nothing runs a blocking full VACUUM any more — re-derive the tcpSocket liveness"
+  );
+
   // The opt-in patch back to HTTP must stay available and must clear tcpSocket,
   // or a strategic-merge patch would leave a container with two probe handlers.
   const patch = firstOfKind(
@@ -163,7 +177,7 @@ test("liveness is tcpSocket, because a synchronous checkpoint stalls HTTP", () =
   assert.equal(patched.tcpSocket, null, "the patch must null out tcpSocket");
 });
 
-test("the startup budget covers the cold-start VACUUM, not just migrations", () => {
+test("the startup budget covers the cold-start rebuild, not just migrations", () => {
   const deploy = firstOfKind(
     loadYaml<K8sDoc>("deploy/kubernetes/base/deployment.yaml"),
     "Deployment"
@@ -171,22 +185,44 @@ test("the startup budget covers the cold-start VACUUM, not just migrations", () 
   const startup = required(containerOf(deploy).startupProbe, "startup probe");
   const budgetSeconds = (startup.periodSeconds ?? 0) * (startup.failureThreshold ?? 0);
 
-  // Cold start replays the WAL and runs the startup cleanup VACUUM, which is
-  // minutes on a large database on network storage. Killing the pod mid-VACUUM
-  // is what creates the oversized WAL that makes the next boot slower, so a
-  // tight budget here is self-amplifying. Readiness holds traffic back for
-  // exactly as long as this takes, so the budget is free.
+  // Cold start is not just migrations. Opening the database runs the legacy
+  // call-log offload, which checkpoints the WAL and then rebuilds the file with
+  // a full VACUUM (src/lib/db/core.ts) — minutes on a large database on network
+  // storage — and the startup cleanup pass 30s later reclaims freed pages on the
+  // same synchronous connection. Killing the pod in the middle is what *creates*
+  // the oversized WAL that makes the next boot slower, so a tight budget here is
+  // self-amplifying. Readiness holds traffic back for exactly as long as this
+  // takes, so the budget is free.
   assert.ok(
     budgetSeconds >= 600,
-    `startup budget is ${budgetSeconds}s; a cold-start VACUUM on a large ` +
-      "database takes minutes, and a kill mid-VACUUM makes the next boot slower"
+    `startup budget is ${budgetSeconds}s; a cold-start rebuild on a large ` +
+      "database takes minutes, and killing it mid-rebuild makes the next boot slower"
   );
 
+  const core = fs.readFileSync(path.join(REPO_ROOT, "src/lib/db/core.ts"), "utf8");
+  assert.match(
+    core,
+    /offloadLegacyCallLogDetails\(db\);/,
+    "the open path no longer offloads legacy call logs — re-derive the startup budget"
+  );
+  assert.match(
+    core,
+    /wal_checkpoint\(TRUNCATE\)[\s\S]{0,80}?db\.exec\("VACUUM"\)/,
+    "the offload no longer checkpoints and rebuilds — re-derive the startup budget"
+  );
+
+  // #12821 took the blocking full VACUUM out of the cleanup path, but the
+  // startup pass still reclaims pages synchronously on the same event loop.
   const cleanup = fs.readFileSync(path.join(REPO_ROOT, "src/lib/db/cleanup.ts"), "utf8");
   assert.match(
     cleanup,
-    /startCleanupScheduler[\s\S]*?db\.exec\("VACUUM"\)/,
-    "startup cleanup no longer VACUUMs — re-derive the startup budget"
+    /startCleanupScheduler[\s\S]*?runScheduledCleanupPass\("startup"\)/,
+    "startup no longer runs a cleanup pass — re-derive the startup budget"
+  );
+  assert.match(
+    cleanup,
+    /runScheduledCleanupPass[\s\S]*?reclaimFreedPages\(\)/,
+    "the cleanup pass no longer reclaims pages — re-derive the startup budget"
   );
 });
 

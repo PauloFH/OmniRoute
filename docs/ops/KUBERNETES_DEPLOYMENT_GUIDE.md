@@ -98,8 +98,9 @@ Preview without applying — worth doing before every change:
 kubectl kustomize deploy/kubernetes/overlays/k3s
 ```
 
-Watch it come up. Cold start runs SQLite migrations, replays the WAL and runs
-the startup cleanup VACUUM — minutes on a large database. The startup probe
+Watch it come up. Cold start runs SQLite migrations, replays the WAL, rebuilds
+the file in the legacy call-log offload and reclaims freed pages in the startup
+cleanup pass — minutes on a large database. The startup probe
 allows 10 minutes before liveness begins counting, and readiness keeps traffic
 away for exactly as long as it takes:
 
@@ -287,7 +288,7 @@ The manifests follow
 
 | Probe     | Target                   | Why                                                   |
 | --------- | ------------------------ | ----------------------------------------------------- |
-| Startup   | `GET /healthz`, 120 × 5s | Cold start = migrations + WAL replay + cleanup VACUUM |
+| Startup   | `GET /healthz`, 120 × 5s | Cold start = migrations + WAL replay + file rebuild   |
 | Readiness | `GET /healthz`           | Lifecycle state; 200 vs 503                           |
 | Liveness  | **tcpSocket** on `http`  | Process-alive only, and cannot be starved by the loop |
 
@@ -314,10 +315,10 @@ exists to restart a process that cannot recover.
 
 Both budgets follow from the same fact:
 
-| Setting                         | Value | Because                                                                   |
-| ------------------------------- | ----- | ------------------------------------------------------------------------- |
-| `startupProbe.failureThreshold` | `120` | 10 min for WAL replay + cleanup VACUUM; readiness holds traffic meanwhile |
-| `terminationGracePeriodSeconds` | `300` | The post-drain WAL checkpoint has no timeout; a healthy pod exits in ~45s |
+| Setting                         | Value | Because                                                                           |
+| ------------------------------- | ----- | --------------------------------------------------------------------------------- |
+| `startupProbe.failureThreshold` | `120` | 10 min for WAL replay + the cold-start rebuild; readiness holds traffic meanwhile |
+| `terminationGracePeriodSeconds` | `300` | The post-drain WAL checkpoint has no timeout; a healthy pod exits in ~45s         |
 
 `terminationGracePeriodSeconds` is a **ceiling, not a delay**. `SHUTDOWN_TIMEOUT_MS`
 (30s) bounds only the request drain; `closeDbInstance()` then checkpoints the

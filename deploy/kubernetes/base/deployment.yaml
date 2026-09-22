@@ -66,11 +66,14 @@ spec:
                 # Let kube-proxy drop this pod from Service endpoints before
                 # SIGTERM, so new traffic stops arriving at a dying process.
                 command: ["/bin/sh", "-c", "sleep 15"]
-          # Cold start is not just migrations: it also replays the WAL and runs
-          # the startup cleanup VACUUM (src/lib/db/cleanup.ts). On a ~1 GB
-          # database on network storage that is minutes. A kill mid-VACUUM is
-          # what *creates* the oversized WAL that makes the next boot slower,
-          # so a tight budget here is self-amplifying. 10 min costs nothing —
+          # Cold start is not just migrations: opening the database replays the
+          # WAL and runs the legacy call-log offload, which checkpoints and then
+          # rebuilds the file with a full VACUUM (src/lib/db/core.ts), and the
+          # startup cleanup pass 30s later reclaims freed pages on the same
+          # synchronous connection (src/lib/db/cleanup.ts). On a ~1 GB database
+          # on network storage that is minutes. A kill mid-rebuild is what
+          # *creates* the oversized WAL that makes the next boot slower, so a
+          # tight budget here is self-amplifying. 10 min costs nothing —
           # readiness keeps traffic away for exactly as long as it takes.
           startupProbe:
             httpGet:
@@ -79,7 +82,7 @@ spec:
             periodSeconds: 5
             # The kubelet default is 1s, and /healthz shares the event loop —
             # it exceeds 1s even on a trivial boot, and by minutes during the
-            # cold-start VACUUM.
+            # cold-start rebuild.
             timeoutSeconds: 3
             failureThreshold: 120
           readinessProbe:

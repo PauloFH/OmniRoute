@@ -138,9 +138,10 @@ function buildContainer(spec: DeploySpec): ManifestObject {
       periodSeconds: 5,
       // The kubelet default is 1s, and /healthz shares the event loop.
       timeoutSeconds: 3,
-      // 10 min. Cold start replays the WAL and runs the startup cleanup
-      // VACUUM (src/lib/db/cleanup.ts), not just migrations; a kill mid-VACUUM
-      // grows the WAL and makes the next boot slower still.
+      // 10 min. Cold start replays the WAL, runs the legacy call-log offload
+      // — checkpoint plus a full VACUUM (src/lib/db/core.ts) — and reclaims
+      // freed pages in the startup cleanup pass, not just migrations; a kill
+      // mid-rebuild grows the WAL and makes the next boot slower still.
       failureThreshold: 120,
     },
     readinessProbe: {

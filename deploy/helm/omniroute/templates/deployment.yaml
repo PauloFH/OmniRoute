@@ -72,8 +72,9 @@ spec:
                 # Drop this pod from Service endpoints before SIGTERM lands, so
                 # new traffic stops arriving at a process that is shutting down.
                 command: ["/bin/sh", "-c", "sleep {{ .Values.preStopSleepSeconds }}"]
-          # Cold start runs migrations, WAL replay and the startup cleanup
-          # VACUUM, so liveness must not start counting until this passes.
+          # Cold start runs migrations, WAL replay, the legacy call-log
+          # offload (checkpoint + full VACUUM) and the startup cleanup pass, so
+          # liveness must not start counting until this passes.
           startupProbe:
             httpGet:
               path: /healthz
