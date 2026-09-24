@@ -193,6 +193,11 @@ test("the startup budget covers the cold-start rebuild, not just migrations", ()
   // the oversized WAL that makes the next boot slower, so a tight budget here is
   // self-amplifying. Readiness holds traffic back for exactly as long as this
   // takes, so the budget is free.
+  // Arithmetic: budget = periodSeconds x failureThreshold = 5 x 120 = 600s. The
+  // cleanup pass no longer runs a blocking VACUUM (#12821/#12830), so the floor
+  // is derived from what is left on the boot path: WAL replay + migrations, the
+  // legacy call-log offload (checkpoint + VACUUM while legacy rows are pending)
+  // and the incremental reclaim — minutes worst case on network storage.
   assert.ok(
     budgetSeconds >= 600,
     `startup budget is ${budgetSeconds}s; a cold-start rebuild on a large ` +

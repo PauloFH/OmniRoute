@@ -75,6 +75,13 @@ spec:
           # *creates* the oversized WAL that makes the next boot slower, so a
           # tight budget here is self-amplifying. 10 min costs nothing —
           # readiness keeps traffic away for exactly as long as it takes.
+          # Budget = periodSeconds x failureThreshold = 5s x 120 = 600s. The
+          # cleanup pass no longer runs a blocking VACUUM (#12821/#12830); what
+          # remains on the boot path is the WAL replay, migrations, the one-shot
+          # legacy call-log offload (checkpoint + VACUUM, only while legacy rows
+          # are pending) and the incremental page reclaim — still minutes worst
+          # case on network storage, so the 600s ceiling is kept, now justified
+          # by those steps instead of the removed cleanup VACUUM.
           startupProbe:
             httpGet:
               path: /healthz
