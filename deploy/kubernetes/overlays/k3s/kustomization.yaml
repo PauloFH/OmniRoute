@@ -19,3 +19,9 @@ patches:
     target:
       kind: Deployment
       name: omniroute
+
+  # Trimming the limit without trimming the heap is what #7849 describes.
+  - path: heap.yaml
+    target:
+      kind: ConfigMap
+      name: omniroute-config

@@ -39,6 +39,7 @@ interface Probe {
 
 interface Container {
   ports?: { containerPort?: number; name?: string }[];
+  resources?: { limits?: { memory?: string }; requests?: { memory?: string } };
   lifecycle?: { preStop?: { exec?: { command?: string[] } } };
   livenessProbe?: Probe;
   readinessProbe?: Probe;
@@ -88,6 +89,21 @@ function firstOfKind(docs: K8sDoc[], kind: string): K8sDoc {
 function required<T>(value: T | undefined, what: string): T {
   assert.ok(value !== undefined && value !== null, `missing ${what}`);
   return value;
+}
+
+/** The `--max-old-space-size=N` ceiling in MiB, or null when the flag is absent. */
+function heapCeilingMib(doc: K8sDoc): number | null {
+  const match = doc.data?.NODE_OPTIONS?.match(/--max-old-space-size=(\d+)/);
+  return match ? Number(match[1]) : null;
+}
+
+/** A Kubernetes memory quantity in MiB. Only the suffixes these manifests use. */
+function memoryLimitMib(doc: K8sDoc): number | null {
+  const raw = doc.spec?.template?.spec?.containers?.[0]?.resources?.limits?.memory;
+  if (!raw) return null;
+  const match = raw.match(/^(\d+)(Mi|Gi)$/);
+  assert.ok(match, `unsupported memory quantity: ${raw}`);
+  return match[2] === "Gi" ? Number(match[1]) * 1024 : Number(match[1]);
 }
 
 function containerOf(deploy: K8sDoc): Container {
@@ -229,6 +245,58 @@ test("the startup budget covers the cold-start rebuild, not just migrations", ()
     /runScheduledCleanupPass[\s\S]*?reclaimFreedPages\(\)/,
     "the cleanup pass no longer reclaims pages — re-derive the startup budget"
   );
+});
+
+test("no overlay leaves the heap ceiling at or above its own memory limit", () => {
+  // The base pair is checked directly; an overlay then inherits whichever half
+  // it does not patch. Trimming the limit for a smaller node while the base
+  // ceiling stays put is invisible in either file alone — it only exists in the
+  // rendered combination, which is how a 3072 MB ceiling ended up under a 2Gi
+  // cgroup. Above the cgroup the kernel OOM-kills the pod instead of Node
+  // raising a recoverable heap error (#7849): the process dies with every
+  // in-flight stream and writes no useful log.
+  const baseHeap = required(
+    heapCeilingMib(
+      firstOfKind(loadYaml<K8sDoc>("deploy/kubernetes/base/configmap.yaml"), "ConfigMap")
+    ),
+    "base heap ceiling"
+  );
+  const baseLimit = required(
+    memoryLimitMib(
+      firstOfKind(loadYaml<K8sDoc>("deploy/kubernetes/base/deployment.yaml"), "Deployment")
+    ),
+    "base memory limit"
+  );
+  assert.ok(
+    baseHeap < baseLimit,
+    `base heap ceiling is ${baseHeap} MiB against a ${baseLimit} MiB limit`
+  );
+
+  const overlaysDir = path.join(K8S_DIR, "overlays");
+  const overlays = fs
+    .readdirSync(overlaysDir)
+    .filter((name) => fs.statSync(path.join(overlaysDir, name)).isDirectory());
+  assert.ok(overlays.length > 0, "expected at least one overlay");
+
+  for (const overlay of overlays) {
+    let heap = baseHeap;
+    let limit = baseLimit;
+    const rel = `deploy/kubernetes/overlays/${overlay}`;
+    for (const file of fs.readdirSync(path.join(overlaysDir, overlay))) {
+      if (!file.endsWith(".yaml") || file === "kustomization.yaml") continue;
+      for (const doc of loadYaml<K8sDoc>(`${rel}/${file}`)) {
+        const patchedHeap = heapCeilingMib(doc);
+        if (patchedHeap !== null) heap = patchedHeap;
+        const patchedLimit = memoryLimitMib(doc);
+        if (patchedLimit !== null) limit = patchedLimit;
+      }
+    }
+    assert.ok(
+      heap < limit,
+      `overlay ${overlay} renders a ${heap} MiB heap ceiling against a ${limit} MiB ` +
+        "memory limit; trim the ceiling with the limit, not after it"
+    );
+  }
 });
 
 test("the drain budget fits inside the termination grace period", () => {
