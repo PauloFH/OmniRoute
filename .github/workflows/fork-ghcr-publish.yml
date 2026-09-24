@@ -1,0 +1,104 @@
+# FORK-ONLY — never merge this file upstream.
+#
+# It publishes to THIS fork's own GHCR namespace and exists purely to feed the
+# operator's own clusters. AGENTS.md -> "Upstream contributions": keep fork-only
+# deployment and personal automation changes out of upstream PRs. The upstream
+# `docker-publish.yml` is the real one; it is hardcoded to diegosouzapw/omniroute
+# and logs into Docker Hub with secrets this fork does not have.
+name: Fork image publish (GHCR)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or SHA to build"
+        required: true
+        default: feat/k8s-deploy
+      tag:
+        description: "Image tag to publish (arch suffix is appended)"
+        required: true
+        default: 3.8.51-k8s
+      platform:
+        description: "Target platform"
+        required: true
+        default: linux/arm64
+        type: choice
+        options:
+          - linux/arm64
+          - linux/amd64
+
+concurrency:
+  group: fork-ghcr-${{ inputs.ref }}-${{ inputs.platform }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: Build ${{ inputs.platform }}
+    # arm64 lands on GitHub's hosted ARM runner — the same one upstream uses for
+    # the published ARM image. amd64 is selectable but expect it to fail: the
+    # hosted ubuntu-24.04 is ~7 GB and dies ResourceExhausted on this tree
+    # (#11976), which is why docker-publish.yml routes amd64 to a self-hosted
+    # 31 GB box. Build amd64 locally instead and `docker push` it to the same tag.
+    runs-on: ${{ inputs.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    steps:
+      # Turbopack's native peak is not bounded by --max-old-space-size (#6409),
+      # so the runner needs swap headroom before the build starts. Mirrors
+      # build.yml. Webpack is used below, but the headroom is cheap insurance.
+      - name: Expand virtual memory (10 GB swap)
+        run: |
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile /swapfile
+          sudo fallocate -l 10G /mnt/swapfile || sudo dd if=/dev/zero of=/mnt/swapfile bs=1M count=10240
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -h
+
+      - name: Checkout the ref being built
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      # GHCR rejects an uppercase path, and this fork's owner is mixed case.
+      - name: Resolve the image name
+        id: img
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          lower=$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')
+          echo "name=ghcr.io/${lower}/omniroute" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Webpack, not Turbopack: docker-publish.yml pins OMNIROUTE_USE_TURBOPACK=0
+      # on both arches after Turbopack raised TurbopackInternalError 26 min into a
+      # build on a 32-core box. The Dockerfile documents it as the escape hatch.
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: runner-base
+          platforms: ${{ inputs.platform }}
+          build-args: |
+            OMNIROUTE_USE_TURBOPACK=0
+            OMNIROUTE_BUILD_MEMORY_MB=12288
+          push: true
+          tags: ${{ steps.img.outputs.name }}:${{ inputs.tag }}-${{ inputs.platform == 'linux/arm64' && 'arm64' || 'amd64' }}
+
+      - name: Say where it landed
+        run: |
+          echo "Pushed ${{ steps.img.outputs.name }}:${{ inputs.tag }}-${{ inputs.platform == 'linux/arm64' && 'arm64' || 'amd64' }}"
+          echo "The package is PRIVATE by default — make it public, or give the cluster an imagePullSecret."
